@@ -42,36 +42,57 @@ async function getRegionId(
   location: string,
   apiKey: string
 ): Promise<string | null> {
-  try {
-    const res = await fetch(
-      `https://${RAPIDAPI_HOST}/v2/regions?query=${encodeURIComponent(
-        location
-      )}&locale=en_US&siteid=300000001`,
-      {
-        headers: {
-          "X-RapidAPI-Key": apiKey,
-          "X-RapidAPI-Host": RAPIDAPI_HOST,
-        },
+  const searchTerms = [
+    location,
+    location.split(",")[0].trim(),
+    location.split(",")[0].trim() + " FL",
+    location.split(",")[0].trim() + " Beach FL",
+  ];
+
+  for (const term of searchTerms) {
+    try {
+      logger.log(`Trying region search: "${term}"`);
+      const res = await fetch(
+        `https://${RAPIDAPI_HOST}/v2/regions?query=${encodeURIComponent(
+          term
+        )}&locale=en_US&siteid=300000001`,
+        {
+          headers: {
+            "X-RapidAPI-Key": apiKey,
+            "X-RapidAPI-Host": RAPIDAPI_HOST,
+          },
+        }
+      );
+      if (!res.ok) {
+        // Log the actual error so we can debug it
+        const errBody = await res.text().catch(() => "");
+        logger.warn(
+          `Region API HTTP ${res.status} for "${term}": ${errBody.slice(0, 300)}`
+        );
+        continue;
       }
-    );
-    if (!res.ok) {
-      logger.warn(`Region search HTTP error: ${res.status}`);
-      return null;
+      const data = await res.json();
+      const regions: any[] = data?.data ?? [];
+      logger.log(`Region results for "${term}": ${regions.length} found`);
+      if (regions.length > 0) {
+        logger.log(`First result: type=${regions[0]?.type} gaiaId=${regions[0]?.gaiaId}`);
+      }
+      const region =
+        regions.find(
+          (r: any) =>
+            r.type === "CITY" ||
+            r.type === "NEIGHBORHOOD" ||
+            r.type === "AIRPORT"
+        ) ?? regions[0];
+      if (region?.gaiaId) {
+        logger.log(`Found region ID: ${region.gaiaId} for "${term}"`);
+        return region.gaiaId;
+      }
+    } catch (e) {
+      logger.warn(`Region search failed for "${term}": ${e}`);
     }
-    const data = await res.json();
-    const regions: any[] = data?.data ?? [];
-    const region =
-      regions.find(
-        (r: any) =>
-          r.type === "CITY" ||
-          r.type === "NEIGHBORHOOD" ||
-          r.type === "AIRPORT"
-      ) ?? regions[0];
-    return region?.gaiaId ?? null;
-  } catch (e) {
-    logger.warn(`Region search failed for ${location}: ${e}`);
-    return null;
   }
+  return null;
 }
 
 async function searchHotels(
@@ -93,7 +114,8 @@ async function searchHotels(
       },
     });
     if (!res.ok) {
-      logger.warn(`Hotel search HTTP error: ${res.status}`);
+      const errBody = await res.text().catch(() => "");
+      logger.warn(`Hotel search HTTP ${res.status}: ${errBody.slice(0, 300)}`);
       return [];
     }
     const data = await res.json();
@@ -169,6 +191,54 @@ Output only the post text. Nothing else.`;
   return text;
 }
 
+// ─── Generic Discovery Post (fallback when hotel API fails) ───────────────────
+async function postGenericDiscovery(
+  location: string,
+  checkIn: string,
+  checkOut: string,
+  affId: string,
+  client: Anthropic,
+  fbPageId: string,
+  fbToken: string
+): Promise<void> {
+  const searchLink = buildAffiliateLink(location, checkIn, checkOut, affId);
+  const openerStyle =
+    OPENER_STYLES[Math.floor(Math.random() * OPENER_STYLES.length)];
+
+  const prompt = `You write Facebook posts for a hotel deals page covering ${location} travel.
+
+Write one short Facebook post encouraging people to check out hotel deals in ${location} for the coming days.
+Use this affiliate search link: ${searchLink}
+
+Rules:
+1. NEVER use "You know that feeling" — banned everywhere.
+2. Use this opener style: ${openerStyle}
+3. Keep it casual and genuine — like a friend texting a tip.
+4. Include the search link at the end.
+5. 2–4 sentences. Keep it punchy.
+6. 1–2 emojis only.
+7. No hashtags.
+8. Make it feel specific to ${location}.
+
+Output only the post text. Nothing else.`;
+
+  const msg = await client.messages.create({
+    model: AI_MODEL,
+    max_tokens: 300,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const text = msg.content[0].type === "text" ? msg.content[0].text.trim() : "";
+  if (!text) {
+    logger.error("Claude returned empty text for generic post");
+    return;
+  }
+
+  logger.log("Generated generic discovery post", { text });
+  const postId = await postToFacebook(text, fbPageId, fbToken);
+  logger.log("✅ Posted generic discovery post", { postId, location });
+}
+
 async function postToFacebook(
   text: string,
   fbPageId: string,
@@ -214,7 +284,8 @@ async function runBotForLocation(location: string): Promise<void> {
   // 1. Get region ID
   const regionId = await getRegionId(location, rapidApiKey);
   if (!regionId) {
-    logger.error(`Could not find region ID for: ${location}`);
+    logger.warn(`Could not find region ID for: ${location} — falling back to generic discovery post`);
+    await postGenericDiscovery(location, checkIn, checkOut, affId, aiClient, fbPageId, fbToken);
     return;
   }
   logger.log(`Region ID: ${regionId}`);
@@ -222,7 +293,8 @@ async function runBotForLocation(location: string): Promise<void> {
   // 2. Search hotels
   const hotels = await searchHotels(regionId, checkIn, checkOut, rapidApiKey);
   if (hotels.length === 0) {
-    logger.warn(`No hotels found for ${location} on ${checkIn}`);
+    logger.warn(`No hotels found for ${location} — falling back to generic discovery post`);
+    await postGenericDiscovery(location, checkIn, checkOut, affId, aiClient, fbPageId, fbToken);
     return;
   }
   logger.log(`Found ${hotels.length} hotels`);
